@@ -47,14 +47,12 @@ logging.basicConfig(level=logging.INFO)
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
-# ================== COBALT BACKUP API (INSTAGRAM FALLBACK #1) ==================
-# Primary: ClipsSaver -> Backup: Cobalt -> Last resort: gallery-dl
-# Override via env: COBALT_API_URL / COBALT_API_KEY
-COBALT_API_URL = os.getenv("COBALT_API_URL", "https://api.cobalt.tools/")
-COBALT_API_KEY = os.getenv(
-    "COBALT_API_KEY",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJkd1VGak9WRCIsInN1YiI6IkNzUmhtdmtWIiwiZXhwIjoxNzg5NDA2MzYzfQ.M1rFSh0S--siq0pm-VyGcJt_cAbyseZHSnYIgMAnUac",
-)
+# ================== INDOWN.AI BACKUP API (INSTAGRAM FALLBACK #1) ==================
+# Primary: ClipsSaver -> Backup: indown.ai -> Last resort: gallery-dl
+# indown.ai requires dynamic k_exp/k_token scraped from https://indown.ai/en
+# before each POST to https://indown.ai/api/ajaxSearch. Nothing is hardcoded.
+INDOWN_PAGE_URL = os.getenv("INDOWN_PAGE_URL", "https://indown.ai/en")
+INDOWN_API_URL = os.getenv("INDOWN_API_URL", "https://indown.ai/api/ajaxSearch")
 
 def is_cancelled(key: str) -> bool:
     return cancel_flags.get(key, False)
@@ -275,112 +273,155 @@ def fetch_clipssaver_data(url: str):
     raise last_exc
 
 
-# ================== COBALT API (INSTAGRAM BACKUP) ==================
-def _cobalt_guess_is_video(filename: str, direct_url: str) -> bool:
-    fn = (filename or "").lower()
-    u = (direct_url or "").split("?")[0].lower()
-    image_exts = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif", ".avif", ".jfif", ".tiff")
-    video_exts = (".mp4", ".mov", ".mkv", ".webm", ".m4v", ".gif")
-    if fn.endswith(image_exts) or u.endswith(image_exts):
-        return False
-    if fn.endswith(video_exts) or u.endswith(video_exts):
-        return True
-    # Cobalt picker uses explicit types; for redirect default to video (IG reels/posts are video-heavy)
-    # but if filename hints image, we already returned False above.
-    if fn.endswith((".mp3", ".m4a", ".opus", ".ogg", ".wav")):
-        return True  # treat audio as video-file path; sender will upload as video (or extend later)
-    return True
+# ================== INDOWN.AI API (INSTAGRAM BACKUP) ==================
+# Flow: GET INDOWN_PAGE_URL -> regex k_exp/k_token (dynamic, never hardcoded)
+#    -> POST INDOWN_API_URL (form-urlencoded, same session) -> parse media links.
+# Same public contract as before: returns [(direct_url, is_video), ...].
+_K_EXP_RE = re.compile(r'k_exp\s*=\s*["\'](\d+)["\']')
+_K_TOKEN_RE = re.compile(r'k_token\s*=\s*["\']([^"\']+)["\']')
+_ANCHOR_RE = re.compile(r'<a\b[^>]*href="([^"]+)"[^>]*>(.*?)</a>', re.S | re.I)
+_TAG_STRIP_RE = re.compile(r'<[^>]+>')
 
 
-def fetch_cobalt_media_list(url: str):
-    """Call Cobalt API and return [(direct_media_url, is_video), ...].
+def _indown_extract_tokens(page_html: str):
+    """Extract dynamic (k_exp, k_token) from indown.ai HTML/JS. Raises if missing."""
+    exp_m = _K_EXP_RE.search(page_html or "")
+    tok_m = _K_TOKEN_RE.search(page_html or "")
+    if not exp_m:
+        raise RuntimeError("indown.ai: k_exp not found on page (layout changed?)")
+    if not tok_m:
+        raise RuntimeError("indown.ai: k_token not found on page (layout changed?)")
+    return exp_m.group(1), tok_m.group(1)
 
-    Handles Cobalt responses:
-      - {"status": "redirect"/"tunnel", "url": "...", "filename": "..."}
-      - {"status": "picker", "picker": [{"type": "video"/"photo"/"gif", "url": "..."}, ...]}
-    Raises on {"status": "error"} or unexpected payload.
+
+def _indown_strip_tags(s: str) -> str:
+    import html as _html
+    return _html.unescape(_TAG_STRIP_RE.sub("", s or "")).strip()
+
+
+def _indown_parse_media(payload_html: str):
+    """Parse indown.ai result HTML into [(direct_url, is_video), ...].
+
+    Observed format: JSON {"status":"ok","v":"v1","data":"<ul class=download-box>
+    <li>...<a title='Download Video'|'Download Image' href='https://dl.snapcdn.app/get?token=...'>..."}
+    Each <li> is one carousel item; a reel <li> holds both a cover Image link
+    and the Video link, so per-<li> we keep video links and drop the cover
+    image when a video is present.
     """
-    if not COBALT_API_KEY:
-        raise RuntimeError("COBALT_API_KEY is not configured")
+    import html as _html
+    soup_html = _html.unescape(payload_html or "")
+    # Split per carousel item; first chunk is the <ul> header without media.
+    blocks = re.split(r'<li\b', soup_html, flags=re.I)[1:] or [soup_html]
+    media = []
+    seen = set()
+    for block in blocks:
+        block_media = []
+        for m in _ANCHOR_RE.finditer(block):
+            href = _html.unescape(m.group(1)).strip()
+            if not href or href.startswith("/") or "play.google.com" in href:
+                continue
+            # Media links are snapcdn download URLs; skip anything else.
+            if "snapcdn.app" not in href:
+                continue
+            label = _indown_strip_tags(m.group(0)).lower()
+            if "video" in label:
+                is_video = True
+            elif "image" in label or "photo" in label or "picture" in label:
+                is_video = False
+            else:
+                # No explicit label: guess by extension, default to video
+                # (Instagram backup traffic is video-heavy).
+                low = href.split("?")[0].lower()
+                if low.endswith((".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".heif")):
+                    is_video = False
+                else:
+                    is_video = True
+            block_media.append((href, is_video))
+        # A reel block contains cover-image + video: keep only the video(s).
+        if any(is_v for _, is_v in block_media):
+            block_media = [(u, v) for u, v in block_media if v]
+        for item in block_media:
+            if item[0] not in seen:
+                seen.add(item[0])
+                media.append(item)
+    return media
 
-    # Ensure trailing slash: Cobalt expects POST / (your capture shows :path /)
-    api_url = COBALT_API_URL if COBALT_API_URL.endswith("/") else COBALT_API_URL + "/"
 
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {COBALT_API_KEY}",
-        "Origin": "https://cobalt.tools",
-        "Referer": "https://cobalt.tools/",
+def fetch_indown_media_list(url: str):
+    """Call indown.ai and return [(direct_media_url, is_video), ...].
+
+    Raises RuntimeError with a human-readable message on invalid URLs,
+    private posts, rate limits, or unexpected payloads.
+    """
+    if not url or not is_instagram_url(url):
+        raise RuntimeError("indown.ai: invalid Instagram URL")
+
+    headers_get = {"User-Agent": USER_AGENT}
+    headers_post = {
+        "Accept": "*/*",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": "https://indown.ai",
+        "Referer": "https://indown.ai/en",
+        "X-Requested-With": "XMLHttpRequest",
         "User-Agent": USER_AGENT,
-    }
-    payload = {
-        "localProcessing": "preferred",
-        "url": url,
     }
 
     last_exc = None
     for attempt in range(2):
         try:
-            resp = requests.post(api_url, json=payload, headers=headers, timeout=30)
-            # Cobalt returns 200 with {"status": "error", ...} on logical failures
+            # Same session for GET+POST so cookies/session state are preserved.
+            session = requests.Session()
+            page = session.get(INDOWN_PAGE_URL, headers=headers_get, timeout=20)
+            page.raise_for_status()
+            k_exp, k_token = _indown_extract_tokens(page.text)
+
+            # requests url-encodes the Instagram URL in the form body for us.
+            form = {
+                "k_exp": k_exp,
+                "k_token": k_token,
+                "q": url,
+                "t": "media",
+                "lang": "en",
+                "v": "v2",
+            }
+            resp = session.post(INDOWN_API_URL, data=form, headers=headers_post, timeout=30)
             resp.raise_for_status()
-            data = resp.json()
+            try:
+                data = resp.json()
+            except Exception:
+                raise RuntimeError("indown.ai: unexpected (non-JSON) API response")
             if not isinstance(data, dict):
-                raise RuntimeError(f"Unexpected Cobalt response: {str(data)[:300]}")
+                raise RuntimeError("indown.ai: unexpected API response shape")
 
-            status = data.get("status")
-            if status in ("redirect", "tunnel"):
-                direct = data.get("url")
-                if not direct:
-                    raise RuntimeError(f"Cobalt {status} missing url: {str(data)[:300]}")
-                filename = data.get("filename", "")
-                return [(direct, _cobalt_guess_is_video(filename, direct))]
-
-            if status == "picker":
-                picker = data.get("picker") or []
-                media = []
-                for item in picker:
-                    if not isinstance(item, dict):
-                        continue
-                    u = item.get("url")
-                    if not u:
-                        continue
-                    typ = (item.get("type") or "").lower()
-                    if typ in ("photo", "image", "picture"):
-                        media.append((u, False))
-                    elif typ in ("video", "gif", "loop"):
-                        media.append((u, True))
-                    else:
-                        # Fallback to extension guess
-                        fn = item.get("filename", "") or ""
-                        media.append((u, _cobalt_guess_is_video(fn, u)))
+            payload_html = data.get("data") or data.get("html") or ""
+            if payload_html:
+                media = _indown_parse_media(payload_html)
                 if not media:
-                    raise RuntimeError(f"Cobalt picker empty: {str(data)[:300]}")
+                    raise RuntimeError("indown.ai: no downloadable media found in response")
                 return media
 
-            if status == "error":
-                err = data.get("error") or data
-                raise RuntimeError(f"Cobalt error: {str(err)[:400]}")
-
-            raise RuntimeError(f"Unexpected Cobalt status: {str(data)[:400]}")
+            # No media HTML: surface the server message (invalid URL, private, etc.)
+            mess = _indown_strip_tags(str(data.get("mess") or data.get("message") or ""))
+            if mess:
+                raise RuntimeError(f"indown.ai: {mess[:300]}")
+            raise RuntimeError(f"indown.ai: unexpected API response: {str(data)[:300]}")
         except Exception as e:
             last_exc = e
-            # Don't retry logical Cobalt errors (status=error) — only transport errors
             msg = str(e)
-            if "Cobalt error:" in msg or "Unexpected Cobalt" in msg or "picker empty" in msg:
+            # Logical errors (bad URL, private post, layout change) won't fix on retry.
+            if msg.startswith("indown.ai:"):
                 raise
-            logging.warning(f"Cobalt attempt {attempt+1}/2 failed: {e}")
+            logging.warning(f"InDown attempt {attempt+1}/2 failed: {e}")
             if attempt < 1:
                 import time
                 time.sleep(2)
     raise last_exc
 
 
-async def run_cobalt_fallback(client: Client, message: Message, processing_msg: Message, url: str):
-    """Backup #1 for Instagram: Cobalt API. Shares cancel_key with caller.
+async def run_indown_fallback(client: Client, message: Message, processing_msg: Message, url: str):
+    """Backup #1 for Instagram: indown.ai. Shares cancel_key with caller.
 
-    Downloads via Cobalt direct URL(s) and uploads to Telegram.
+    Downloads via indown.ai direct URL(s) and uploads to Telegram.
     Raises on any failure so caller can fall through to gallery-dl.
     """
     cancel_key = f"{message.chat.id}:{processing_msg.id}"
@@ -388,15 +429,15 @@ async def run_cobalt_fallback(client: Client, message: Message, processing_msg: 
         cancel_flags[cancel_key] = False
     cancel_markup = get_cancel_markup(processing_msg.id, message.from_user.id)
     try:
-        await processing_msg.edit_text("⚠️ Clipsaver failed, trying backup API (Cobalt)...", reply_markup=cancel_markup)
+        await processing_msg.edit_text("⚠️ Clipsaver failed, trying backup API (InDown)...", reply_markup=cancel_markup)
     except:
         pass
 
-    job_dir = os.path.join(BASE_DIR, "downloads", f"cobalt_{os.urandom(8).hex()}")
+    job_dir = os.path.join(BASE_DIR, "downloads", f"indown_{os.urandom(8).hex()}")
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        media_list = await asyncio.to_thread(fetch_cobalt_media_list, url)
+        media_list = await asyncio.to_thread(fetch_indown_media_list, url)
         if is_cancelled(cancel_key):
             try:
                 await processing_msg.edit_text("❌ Cancelled.")
@@ -405,7 +446,7 @@ async def run_cobalt_fallback(client: Client, message: Message, processing_msg: 
             return
 
         if not media_list:
-            raise RuntimeError("Cobalt returned no media")
+            raise RuntimeError("InDown returned no media")
 
         try:
             await processing_msg.edit_text(f"⬇️ Downloading {len(media_list)} item(s) via backup...", reply_markup=cancel_markup)
@@ -413,7 +454,7 @@ async def run_cobalt_fallback(client: Client, message: Message, processing_msg: 
             pass
 
         def download_file(media_url, path):
-            headers = {"User-Agent": USER_AGENT, "Referer": "https://www.instagram.com/"}
+            headers = {"User-Agent": USER_AGENT, "Referer": "https://indown.ai/en"}
             res = requests.get(media_url, headers=headers, stream=True, timeout=60)
             res.raise_for_status()
             with open(path, "wb") as f:
@@ -447,7 +488,7 @@ async def run_cobalt_fallback(client: Client, message: Message, processing_msg: 
                 downloaded_files.append((file_path, is_video))
 
         if not downloaded_files:
-            raise RuntimeError("Cobalt download produced no files")
+            raise RuntimeError("InDown download produced no files")
 
         if is_cancelled(cancel_key):
             try:
@@ -699,7 +740,7 @@ async def run_clipssaver_fallback(client: Client, message: Message, processing_m
                 pass
             return
         logging.error(f"ClipsSaver API error: {e}")
-        # Chain: Clipsaver -> Cobalt (backup #1) -> gallery-dl (last resort)
+        # Chain: Clipsaver -> indown.ai (backup #1) -> gallery-dl (last resort)
         try:
             if is_cancelled(cancel_key):
                 try:
@@ -707,16 +748,16 @@ async def run_clipssaver_fallback(client: Client, message: Message, processing_m
                 except:
                     pass
                 return
-            await run_cobalt_fallback(client, message, processing_msg, url)
+            await run_indown_fallback(client, message, processing_msg, url)
             return
-        except Exception as cobalt_e:
+        except Exception as indown_e:
             if is_cancelled(cancel_key):
                 try:
                     await processing_msg.edit_text("❌ Cancelled.")
                 except:
                     pass
                 return
-            logging.error(f"Cobalt backup also failed: {cobalt_e}")
+            logging.error(f"InDown backup also failed: {indown_e}")
         # Last resort: gallery-dl
         try:
             try:
