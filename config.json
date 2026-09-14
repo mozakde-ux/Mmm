@@ -1,0 +1,46 @@
+{
+  "inbounds": [
+    {
+      "port": 10808,
+      "listen": "127.0.0.1",
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "104.18.155.146",
+            "port": 2096,
+            "users": [
+              {
+                "id": "ef9d2063-0140-472b-8b17-ba02ba4b4435",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "plain-glitter-b1ca.mozforush.workers.dev",
+          "fingerprint": "chrome"
+        },
+        "wsSettings": {
+          "path": "/",
+          "headers": {
+            "Host": "plain-glitter-b1ca.mozforush.workers.dev"
+          }
+        }
+      }
+    }
+  ]
+}

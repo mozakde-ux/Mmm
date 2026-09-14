@@ -1,0 +1,10 @@
+pyrogram
+tgcrypto
+yt-dlp
+requests
+python-dotenv
+shazamio
+yt-dlp-ejs
+pysocks
+gallery-dl
+pillow
