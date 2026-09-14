@@ -242,6 +242,163 @@ def convert_to_jpg(image_path):
         logging.error(f"Image conversion failed for {image_path}: {e}")
         return image_path
 
+# ================== VIDEO METADATA / THUMBNAILS ==================
+# Some Instagram MP4s show as 00:00 with no thumbnail in Telegram when sent
+# as a bare file: Telegram fails to parse their metadata server-side.
+# Fix: probe duration/dimensions with ffprobe, generate a thumbnail with
+# ffmpeg, remux to faststart, and pass everything explicitly to Telegram.
+# All helpers degrade gracefully (behave like before) if ffmpeg is missing.
+_FFMPEG_OK = None
+
+
+def _ffmpeg_available() -> bool:
+    global _FFMPEG_OK
+    if _FFMPEG_OK is None:
+        _FFMPEG_OK = bool(shutil.which("ffprobe") and shutil.which("ffmpeg"))
+        if not _FFMPEG_OK:
+            logging.warning("ffprobe/ffmpeg not found: videos will be sent without duration/thumbnail")
+    return _FFMPEG_OK
+
+
+def probe_video_meta(path: str):
+    """Return (duration_sec, width, height) for a video file, (0, 0, 0) on failure."""
+    try:
+        if not _ffmpeg_available() or not os.path.exists(path):
+            return 0, 0, 0
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "format=duration:stream=width,height",
+             "-of", "default=noprint_wrappers=1", path],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        duration, width, height = 0, 0, 0
+        for line in out.splitlines():
+            k, _, v = line.partition("=")
+            k, v = k.strip(), v.strip()
+            try:
+                if k == "duration" and not duration:
+                    duration = int(float(v))
+                elif k == "width" and not width:
+                    width = int(v)
+                elif k == "height" and not height:
+                    height = int(v)
+            except ValueError:
+                continue
+        return duration, width, height
+    except Exception as e:
+        logging.warning(f"ffprobe failed for {path}: {e}")
+        return 0, 0, 0
+
+
+def ensure_faststart(path: str) -> str:
+    """Remux MP4 in place so the moov atom is at the front (progressive playback).
+
+    Uses -c copy (no re-encode, fast). Returns path (original on any failure).
+    """
+    try:
+        if not _ffmpeg_available() or not path.lower().endswith(".mp4"):
+            return path
+        tmp = path + ".faststart.mp4"
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", path,
+             "-c", "copy", "-movflags", "+faststart", tmp],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, path)
+        elif os.path.exists(tmp):
+            os.remove(tmp)
+        return path
+    except Exception as e:
+        logging.warning(f"faststart remux failed for {path}: {e}")
+        return path
+
+
+def make_video_thumb(path: str, duration: int = 0):
+    """Generate a small JPG thumbnail for a video. Returns path or None."""
+    try:
+        if not _ffmpeg_available() or not os.path.exists(path):
+            return None
+        # Seek near the start but safely inside the file for short clips.
+        seek = 0.5
+        if duration and duration > 1:
+            seek = min(1.0, duration / 2)
+        thumb = os.path.splitext(path)[0] + ".thumb.jpg"
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-ss", str(seek), "-i", path,
+             "-vframes", "1", "-vf", "scale=320:-1", "-q:v", "4", thumb],
+            capture_output=True, text=True, timeout=60,
+        )
+        if r.returncode == 0 and os.path.exists(thumb) and os.path.getsize(thumb) > 0:
+            return thumb
+        if os.path.exists(thumb):
+            os.remove(thumb)
+        return None
+    except Exception as e:
+        logging.warning(f"thumbnail generation failed for {path}: {e}")
+        return None
+
+
+def prepare_video(path: str):
+    """Faststart-remux + probe + thumbnail. Returns dict for send_video/InputMediaVideo.
+
+    Only includes duration/width/height when valid (>0) so Telegram never
+    gets a bogus 0 forced over what it could parse itself.
+    """
+    path = ensure_faststart(path)
+    duration, width, height = probe_video_meta(path)
+    thumb = make_video_thumb(path, duration)
+    kwargs = {}
+    if duration > 0:
+        kwargs["duration"] = duration
+    if width > 0 and height > 0:
+        kwargs["width"] = width
+        kwargs["height"] = height
+    if thumb:
+        kwargs["thumb"] = thumb
+    return kwargs
+
+
+def _cleanup_thumb(kwargs: dict):
+    try:
+        thumb = kwargs.get("thumb")
+        if thumb and os.path.exists(thumb):
+            os.remove(thumb)
+    except Exception:
+        pass
+
+
+async def send_video_file(client: Client, chat_id, path: str, reply_to=None, caption=None):
+    """Send one video with duration/dimensions/thumbnail attached. Thread-safe."""
+    kwargs = await asyncio.to_thread(prepare_video, path)
+    try:
+        send_kwargs = {"supports_streaming": True}
+        if caption is not None:
+            send_kwargs["caption"] = caption
+        await client.send_video(
+            chat_id=chat_id, video=path,
+            reply_to_message_id=reply_to, **send_kwargs, **kwargs,
+        )
+    finally:
+        _cleanup_thumb(kwargs)
+
+
+async def send_video_group(client: Client, chat_id, paths, reply_to=None):
+    """Send up to 10 videos as a media group, each with its own meta/thumbnail."""
+    items = []
+    for p in paths:
+        kwargs = await asyncio.to_thread(prepare_video, p)
+        items.append((InputMediaVideo(p, **kwargs), kwargs))
+    try:
+        await client.send_media_group(
+            chat_id=chat_id, media=[m for m, _ in items],
+            reply_to_message_id=reply_to,
+        )
+    finally:
+        for _, kwargs in items:
+            _cleanup_thumb(kwargs)
+
+
 # ================== CLIPSSAVER API (INSTAGRAM ONLY) ==================
 def fetch_clipssaver_data(url: str):
     is_story = "/stories/" in url
@@ -534,7 +691,7 @@ async def run_indown_fallback(client: Client, message: Message, processing_msg: 
                     except:
                         pass
                     return
-                await client.send_video(chat_id=message.chat.id, video=videos[0], reply_to_message_id=message.id)
+                await send_video_file(client, message.chat.id, videos[0], reply_to=message.id)
             else:
                 for i in range(0, len(videos), 10):
                     if is_cancelled(cancel_key):
@@ -543,8 +700,7 @@ async def run_indown_fallback(client: Client, message: Message, processing_msg: 
                         except:
                             pass
                         return
-                    media_group = [InputMediaVideo(vid) for vid in videos[i:i+10]]
-                    await client.send_media_group(chat_id=message.chat.id, media=media_group, reply_to_message_id=message.id)
+                    await send_video_group(client, message.chat.id, videos[i:i+10], reply_to=message.id)
                     await asyncio.sleep(1)
 
         if is_cancelled(cancel_key):
@@ -707,7 +863,7 @@ async def run_clipssaver_fallback(client: Client, message: Message, processing_m
                     except:
                         pass
                     return
-                await client.send_video(chat_id=message.chat.id, video=videos[0], reply_to_message_id=message.id)
+                await send_video_file(client, message.chat.id, videos[0], reply_to=message.id)
             else:
                 for i in range(0, len(videos), 10):
                     if is_cancelled(cancel_key):
@@ -716,8 +872,7 @@ async def run_clipssaver_fallback(client: Client, message: Message, processing_m
                         except:
                             pass
                         return
-                    media_group = [InputMediaVideo(vid) for vid in videos[i:i+10]]
-                    await client.send_media_group(chat_id=message.chat.id, media=media_group, reply_to_message_id=message.id)
+                    await send_video_group(client, message.chat.id, videos[i:i+10], reply_to=message.id)
                     await asyncio.sleep(1)
 
         if is_cancelled(cancel_key):
@@ -930,7 +1085,7 @@ async def run_gallery_dl_fallback(client: Client, message: Message, processing_m
                 except:
                     pass
                 return
-            await client.send_video(chat_id=message.chat.id, video=vid, reply_to_message_id=message.id)
+            await send_video_file(client, message.chat.id, vid, reply_to=message.id)
             await asyncio.sleep(0.8)
 
         if is_cancelled(cancel_key):
@@ -2081,11 +2236,9 @@ async def run_twitter_handler(client: Client, message: Message, processing_msg: 
             return
         ext = os.path.splitext(file_path)[1].lower()
         if ext in ['.mp4', '.mov', '.webm', '.m4v']:
-            await client.send_video(
-                chat_id=message.chat.id,
-                video=file_path,
-                caption=caption,
-                reply_to_message_id=message.id
+            await send_video_file(
+                client, message.chat.id, file_path,
+                reply_to=message.id, caption=caption,
             )
         elif ext == '.gif':
             await client.send_animation(
@@ -2261,7 +2414,7 @@ async def run_youtube_community_handler(client: Client, message: Message, proces
                     except:
                         pass
                     return
-                await client.send_video(chat_id=message.chat.id, video=vid, caption=caption, reply_to_message_id=message.id)
+                await send_video_file(client, message.chat.id, vid, reply_to=message.id, caption=caption)
 
         try:
             await processing_msg.delete()
@@ -2627,7 +2780,7 @@ async def handle_carousel(client, message, processing_msg, entries, original_url
                         except:
                             pass
                         return
-                    await client.send_video(message.chat.id, videos[0], reply_to_message_id=message.id)
+                    await send_video_file(client, message.chat.id, videos[0], reply_to=message.id)
                 else:
                     for i in range(0, len(videos), 10):
                         if is_cancelled(cancel_key):
@@ -2636,8 +2789,7 @@ async def handle_carousel(client, message, processing_msg, entries, original_url
                             except:
                                 pass
                             return
-                        media_group = [InputMediaVideo(vid) for vid in videos[i:i+10]]
-                        await client.send_media_group(chat_id=message.chat.id, media=media_group, reply_to_message_id=message.id)
+                        await send_video_group(client, message.chat.id, videos[i:i+10], reply_to=message.id)
                         await asyncio.sleep(1)
 
             if is_cancelled(cancel_key):
@@ -2763,11 +2915,9 @@ async def download_video_callback(client: Client, callback: CallbackQuery):
                 pass
             return
 
-        await client.send_video(
-            chat_id=state['chat_id'],
-            video=file_path,
-            caption="✅ Downloaded!",
-            reply_to_message_id=state['orig_msg_id']
+        await send_video_file(
+            client, state['chat_id'], file_path,
+            reply_to=state['orig_msg_id'], caption="✅ Downloaded!",
         )
         if is_cancelled(cancel_key):
             # Upload finished but user cancelled after; cleanup message state but keep upload
